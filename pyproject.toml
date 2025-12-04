@@ -1,0 +1,36 @@
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plate-sampler"
+version = "0.1.1"
+description = "Random sampling utilities for plate-reader datasets (MetaXpress) and Zeiss CZI."
+authors = [
+  { name = "Harri Tapio Jäälinoja" },
+]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+  "click>=8.0",
+  "numpy>=1.23",
+  "tifffile>=2023.8.12",
+]
+
+[project.optional-dependencies]
+# Install with: pip install -e .[czi]
+czi = [
+  "bioio>=1.0.0",
+  "czitools>=0.3",
+]
+mx = []
+
+[project.urls]
+Homepage = "https://example.com/plate-sampler"
+Repository = "https://example.com/plate-sampler"
+
+[project.scripts]
+mx-sampler = "plate_sampler.mx_sampler:main"
+czi-sampler = "plate_sampler.czi_sampler:main"
