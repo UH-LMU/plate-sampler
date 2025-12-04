@@ -227,8 +227,10 @@ def sample_czi_to_tiffs(
         if t_len is None or t_len <= 1:
             t_indices = [None]
         else:
-            k_t = min(n_time_frames, t_len)
-            t_indices = sorted(random.sample(list(range(t_len)), k_t))
+            t_max = t_len - n_time_frames -1
+            # Pick distinct random start t
+            t_start = random.sample(list(range(t_max)), 1)[0]
+            t_indices = np.arange(t_start, t_start + n_time_frames)
 
         if isinstance(channels, str) and channels.lower() == "all":
             channel_indices = None
