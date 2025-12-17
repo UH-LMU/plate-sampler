@@ -1,338 +1,307 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-czi_sampler (Zeiss .czi)
-------------------------
-Randomly sample scenes (and time frames) from a Zeiss .czi file and save them as TIFF images.
+CZI sampler (BioIO version)
 
-- Reading image data: bioio.BioImage
-- Reading metadata (plate/well/site): czitools (best-effort; optional)
-- Export: tifffile
-- Usable as an importable module (functions) and as a CLI via click.
+Modes:
+- Default ("napari"): keep requested consecutive time frames (T) in the stack.
+  -> writes arrays in TCZYX (same content you validated in napari).
+- --cellpose4: export a *single* timepoint per sample and drop T in the output.
+  -> writes arrays as (H,W), (H,W,C), or (Z,H,W,C), channels-last.
+
+Dependencies:
+    pip install bioio bioio-czi tifffile
+
+References:
+- BioIO overview & API (TCZYX, scenes, get_image_data): https://bioio-devs.github.io/bioio/OVERVIEW.html
+- BioImage class (dims, scenes, get_image_data):       https://bioio-devs.github.io/bioio/bioio.BioImage.html
+- bioio-czi plugin details:                             https://pypi.org/project/bioio-czi/
 """
 from __future__ import annotations
 
+import argparse
+import csv
 import os
-import re
 import random
-import json
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
-import tifffile
-import csv
-from datetime import datetime
 
 try:
-    from bioio import BioImage
+    from bioio import BioImage  # BioIO TCZYX interface, scenes, get_image_data
+except Exception as e:  # pragma: no cover
+    raise RuntimeError(
+        "This command requires 'bioio' and 'bioio-czi'.\n"
+        "Install with: pip install bioio bioio-czi"
+    ) from e
+
+try:
+    import tifffile
 except Exception as e:
-    raise ImportError(
-        "bioio is required. Install with `pip install bioio`. Original error: %s" % e
-    )
+    raise RuntimeError("tifffile is required to write TIFF outputs. Please `pip install tifffile`.") from e
 
-try:
-    import czitools  # type: ignore
-except Exception:
-    czitools = None  # type: ignore
+
+# ---------------------------- data classes & utils ----------------------------
 
 @dataclass
-class SceneInfo:
-    scene_id: Union[int, str]
-    well: Optional[str] = None
-    site: Optional[Union[int, str]] = None
-    description: Optional[str] = None
+class SampleRow:
+    scene: Union[int, str]
+    well: str
+    site: str
+    t_indices: str
+    t_pick: Optional[int]
+    channels: str
+    out_path: str
+    dtype: str
+    shape: str
+    mode: str       # "napari" | "cellpose4"
+    run_timestamp: str
+    seed: int
 
 
-def _parse_scene_infos_with_czitools(input_czi: str) -> Dict[Union[int, str], SceneInfo]:
-    results: Dict[Union[int, str], SceneInfo] = {}
-    if czitools is None:
-        return results
-    try:
-        md = None
-        if hasattr(czitools, "read_metadata"):
-            try:
-                md = czitools.read_metadata(input_czi)
-            except Exception:
-                md = None
-        if md is None:
-            reader = None
-            for attr in ("CziFile", "CZIFile", "Reader", "CZIReader"):
-                if hasattr(czitools, attr):
-                    try:
-                        reader = getattr(czitools, attr)(input_czi)
-                        break
-                    except Exception:
-                        reader = None
-            if reader is not None:
-                if hasattr(reader, "meta"):
-                    md = reader.meta
-                elif hasattr(reader, "metadata"):
-                    md = reader.metadata
-                elif hasattr(reader, "metadata_xml"):
-                    md = reader.metadata_xml
-        if md is None:
-            return results
-        md_str = None
-        try:
-            if isinstance(md, str):
-                md_str = md
-            else:
-                md_str = json.dumps(md)
-        except Exception:
-            md_str = None
-        if md_str:
-            well_pattern = re.compile(r"Well(?:ID|Name)?\"?\s*[:=]\s*\"?([A-H]\d{2})", re.IGNORECASE)
-            site_pattern = re.compile(r"Site\"?\s*[:=]\s*\"?(\d+)")
-            scene_int_pattern = re.compile(r"Scene(?:Index|ID)\"?\s*[:=]\s*\"?(\d+)")
-            scene_str_pattern = re.compile(r"Scene\"?\s*[:=]\s*\"?([A-Za-z0-9_-]+)")
-            wells = well_pattern.findall(md_str)
-            sites = site_pattern.findall(md_str)
-            scene_ints = [int(s) for s in scene_int_pattern.findall(md_str)]
-            scene_strs = scene_str_pattern.findall(md_str)
-            n_candidates = max(len(scene_ints), len(scene_strs), len(wells), len(sites))
-            for i in range(n_candidates):
-                scene_id: Union[int, str]
-                if i < len(scene_ints):
-                    scene_id = scene_ints[i]
-                elif i < len(scene_strs):
-                    scene_id = scene_strs[i]
-                else:
-                    scene_id = i
-                well = wells[i] if i < len(wells) else None
-                site = sites[i] if i < len(sites) else None
-                results[scene_id] = SceneInfo(scene_id=scene_id, well=well, site=site)
-        else:
-            try:
-                def get(d, *keys):
-                    cur = d
-                    for k in keys:
-                        if isinstance(cur, dict) and k in cur:
-                            cur = cur[k]
-                        else:
-                            return None
-                    return cur
-                scenes = get(md, "Information", "Image", "S", "Scenes") or []
-                for i, sc in enumerate(scenes):
-                    well = get(sc, "Well") or get(sc, "WellID")
-                    site = get(sc, "Site")
-                    results[i] = SceneInfo(scene_id=i, well=well, site=site)
-            except Exception:
-                pass
-    except Exception:
-        return {}
-    return results
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
-def list_scenes(input_czi: str) -> List[Union[int, str]]:
-    img = BioImage(input_czi)
-    scenes = []
-    if hasattr(img, "scenes") and isinstance(img.scenes, (list, tuple)) and len(img.scenes) > 0:
-        scenes = list(img.scenes)
-    else:
-        if hasattr(img, "set_scene"):
-            i = 0
-            while True:
-                try:
-                    img.set_scene(i)
-                    scenes.append(i)
-                    i += 1
-                except Exception:
-                    break
-    return scenes
+def _parse_channels(ch: str, n_channels: int) -> List[int]:
+    if isinstance(ch, str) and ch.lower() == "all":
+        return list(range(n_channels))
+    indices = [int(x.strip()) for x in str(ch).split(",") if x.strip() != ""]
+    for i in indices:
+        if i < 0 or i >= n_channels:
+            raise ValueError(f"Channel index {i} is out of bounds for C={n_channels}")
+    return indices
 
 
-def _get_time_length(img: BioImage) -> int:
-    for probe in ("T", "t"):
-        try:
-            if hasattr(img, "dims") and probe in getattr(img, "dims"):
-                return int(img.dims[probe])
-        except Exception:
-            pass
-    t_len = 0
-    if hasattr(img, "get_image_data"):
-        try:
-            for ti in range(0, 4096):
-                try:
-                    _ = img.get_image_data("CZYX", T=ti)
-                    t_len += 1
-                except Exception:
-                    break
-        except Exception:
-            pass
-    if t_len == 0:
-        try:
-            _ = img.get_image_data("CZYX")
-            t_len = 1
-        except Exception:
-            t_len = 0
-    return t_len
+# ---------------------------- public API --------------------------------------
 
+def list_scenes(input_czi: Union[str, Path]) -> List[str]:
+    """
+    Return scene identifiers in a CZI.
 
-def _read_frame(img: BioImage, t_index: Optional[int], channels: Optional[Sequence[int]]) -> np.ndarray:
-    kwargs = {}
-    if t_index is not None:
-        kwargs["T"] = int(t_index)
-    if channels is not None:
-        kwargs["C"] = list(channels)
-    arr = img.get_image_data("CZYX", **kwargs)
-    if hasattr(arr, "compute"):
-        arr = arr.compute()
-    return np.asarray(arr)
+    BioIO exposes scene handling via BioImage.scenes and .set_scene().
+    """
+    img = BioImage(str(input_czi))
+    return list(img.scenes)  # e.g., ["Image:0", "Image:1", ...]
 
 
 def sample_czi_to_tiffs(
-    input_czi: str,
-    output_dir: str,
+    input_czi: Union[str, Path],
+    output_dir: Union[str, Path],
     n_images: int = 10,
     n_time_frames: int = 3,
     channels: Union[str, Sequence[int]] = "all",
     seed: Optional[int] = None,
     overwrite: bool = False,
-    manifest_path: Optional[str] = None,
+    manifest_path: Optional[Union[str, Path]] = None,
+    cellpose4: bool = False,
 ) -> List[str]:
-    if seed is not None:
-        random.seed(seed)
-        np.random.seed(seed)
+    """
+    Sample scenes and time windows from a CZI and write TIFFs.
+    Returns list of output file paths.
 
-    os.makedirs(output_dir, exist_ok=True)
+    - Default (napari): keep T window (TCZYX).
+    - cellpose4=True: pick a single timepoint from that window and drop T in output;
+                      write (H,W), (H,W,C), or (Z,H,W,C) (channels-last).
+    """
+    rng = random.Random(seed)
+    outdir = Path(output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
-    scene_map = _parse_scene_infos_with_czitools(input_czi)
+    img = BioImage(str(input_czi))  # 5D TCZYX by default
+    scene_names = list(img.scenes)  # list of scene ids, e.g. ["Image:0", ...]
+    if not scene_names:
+        raise RuntimeError("No scenes found in input CZI.")
+    if n_images > len(scene_names):
+        n_images = len(scene_names)
 
-    img = BioImage(input_czi)
-    scene_ids = list_scenes(input_czi)
-    if len(scene_ids) == 0:
-        scene_ids = [0]
+    picked_scenes = rng.sample(scene_names, k=n_images)
 
-    k = min(n_images, len(scene_ids))
-    chosen_scenes = random.sample(scene_ids, k)
+    # Helper to get dims sizes from the current scene
+    def _scene_dims() -> Tuple[int, int, int, int, int]:
+        # Return T, C, Z, Y, X in exactly this order
+        # Using data.shape and BioIO's TCZYX standard.
+        T, C, Z, Y, X = img.shape  # TCZYX
+        return T, C, Z, Y, X
 
-    written_paths: List[str] = []
+    if manifest_path is None:
+        manifest_path = outdir / "manifest.csv"
 
-    # Manifest
-    manifest_rows: List[List[str]] = []
-    manifest_header = ["scene","well","site","t_indices","channels","out_path","dtype","shape","run_timestamp","seed"]
+    rows: List[SampleRow] = []
+    saved_paths: List[str] = []
 
-    for s in chosen_scenes:
-        try:
-            img.set_scene(s)
-            scene_label = str(s)
-        except Exception:
-            scene_label = str(s)
-            if hasattr(img, "scenes") and s in img.scenes:
-                try:
-                    img.set_scene(img.scenes.index(s))
-                except Exception:
-                    pass
+    for si, sname in enumerate(picked_scenes):
+        img.set_scene(sname)  # change scene
+        T, C, Z, Y, X = _scene_dims()
 
-        t_len = _get_time_length(img)
-        if t_len is None or t_len <= 1:
-            t_indices = [None]
+        # Channels to extract
+        if isinstance(channels, str):
+            chan_idx = _parse_channels(channels, C)
+            chan_label = channels
         else:
-            t_max = t_len - n_time_frames -1
-            # Pick distinct random start t
-            t_start = random.sample(list(range(t_max)), 1)[0]
-            t_indices = np.arange(t_start, t_start + n_time_frames)
+            chan_idx = list(channels)
+            chan_label = ",".join(map(str, chan_idx))
+        if not chan_idx:
+            raise ValueError("No channels selected.")
 
-        if isinstance(channels, str) and channels.lower() == "all":
-            channel_indices = None
+        # Build the consecutive time window (indices in [0, T-1])
+        if T < 1:
+            raise RuntimeError(f"Scene {sname}: time dimension size is {T}.")
+        n_tf = min(max(n_time_frames, 1), T)
+        t_start_max = max(T - n_tf, 0)
+        t_start = rng.randint(0, t_start_max) if T > n_tf else 0
+        t_indices = list(range(t_start, t_start + n_tf))
+
+        stem = Path(input_czi).stem
+        tag = "cellpose4" if cellpose4 else "napari"
+        out_name = f"{stem}_scene{si:03d}_{tag}.tif"
+        out_path = str(outdir / out_name)
+        if (not overwrite) and os.path.exists(out_path):
+            raise FileExistsError(f"{out_path} exists; use --overwrite to replace.")
+
+        if cellpose4:
+            # --- CELLPOSE 4 MODE: pick ONE timepoint, drop T in output ---
+            # Choose the middle of the sampled window
+            t_pick = t_indices[len(t_indices) // 2]
+
+            # Read array as CZYX (single T slice) then convert to channels-last
+            # BioIO returns arrays in requested order and supports per-axis selection.  (TCZYX standard)
+            # https://bioio-devs.github.io/bioio/OVERVIEW.html
+            arr = img.get_image_data("CZYX", T=t_pick, C=chan_idx)  # (C, Z, Y, X) or (C, Y, X) if Z absent
+
+            # Move channels to last
+            if arr.ndim == 4:      # C, Z, Y, X
+                arr = np.moveaxis(arr, 0, -1)  # -> (Z, Y, X, C)
+                zdim = arr.shape[0]
+                cdim = arr.shape[-1]
+
+                # Reduce trivial dims to match {(H,W), (H,W,C), (Z,H,W), (Z,H,W,C)}
+                if zdim == 1 and cdim == 1:
+                    arr = arr[0, :, :, 0]         # -> (H, W)
+                    shape_str = f"(H,W) = {arr.shape}"
+                elif zdim == 1 and cdim > 1:
+                    arr = arr[0, :, :, :]         # -> (H, W, C)
+                    shape_str = f"(H,W,C) = {arr.shape}"
+                elif zdim > 1 and cdim == 1:
+                    arr = arr[:, :, :, 0]         # -> (Z, H, W)
+                    shape_str = f"(Z,H,W) = {arr.shape}"
+                else:
+                    shape_str = f"(Z,H,W,C) = {arr.shape}"
+
+            elif arr.ndim == 3:    # C, Y, X (no Z)
+                arr = np.moveaxis(arr, 0, -1)     # -> (Y, X, C)
+                if arr.shape[-1] == 1:
+                    arr = arr[:, :, 0]            # -> (H, W)
+                    shape_str = f"(H,W) = {arr.shape}"
+                else:
+                    shape_str = f"(H,W,C) = {arr.shape}"
+
+            else:
+                # Extremely rare: if already (Y,X) for single-channel single-Z
+                shape_str = f"(H,W) = {arr.shape}"
+
+            bigtiff = (arr.size * arr.dtype.itemsize) > (4 * 1024**3)
+            tifffile.imwrite(out_path, arr, bigtiff=bigtiff, imagej=False)
+
+            rows.append(SampleRow(
+                scene=sname, well="", site="",
+                t_indices=",".join(map(str, t_indices)),
+                t_pick=t_pick,
+                channels=chan_label,
+                out_path=out_path,
+                dtype=str(arr.dtype),
+                shape=shape_str,
+                mode="cellpose4",
+                run_timestamp=_now_iso(),
+                seed=seed if seed is not None else -1,
+            ))
+            saved_paths.append(out_path)
+
         else:
-            channel_indices = list(map(int, channels))  # type: ignore[arg-type]
+            # --- NAPARI MODE: keep T window as TCZYX ---
+            arr = img.get_image_data("TCZYX", T=t_indices, C=chan_idx)  # (T, C, Z, Y, X)
+            shape_str = f"(T,C,Z,Y,X) = {arr.shape}"
 
-        frames: List[np.ndarray] = []
-        for ti in t_indices:
-            frame = _read_frame(img, t_index=ti, channels=channel_indices)
-            if frame.dtype == np.float64:
-                frame = frame.astype(np.float32)
-            frames.append(frame)
+            bigtiff = (arr.size * arr.dtype.itemsize) > (4 * 1024**3)
+            tifffile.imwrite(out_path, arr, bigtiff=bigtiff, imagej=False,
+                             metadata={"axes": "TCZYX"})
 
-        stack = frames[0][None, ...] if len(frames) == 1 else np.stack(frames, axis=0)
+            rows.append(SampleRow(
+                scene=sname, well="", site="",
+                t_indices=",".join(map(str, t_indices)),
+                t_pick=None,
+                channels=chan_label,
+                out_path=out_path,
+                dtype=str(arr.dtype),
+                shape=shape_str,
+                mode="napari",
+                run_timestamp=_now_iso(),
+                seed=seed if seed is not None else -1,
+            ))
+            saved_paths.append(out_path)
 
-        info = scene_map.get(s) or scene_map.get(str(s))
-        well = (info.well if info else None) or "well"
-        site = (info.site if info else None) or "site"
-        t_label = ("t" + "-".join(["all" if ti is None else str(ti) for ti in t_indices]))
-        base = f"scene-{scene_label}_{well}-{site}_{t_label}.tif"
-        out_path = os.path.join(output_dir, base)
-
-        if os.path.exists(out_path) and not overwrite:
-            suf = 1
-            while True:
-                candidate = os.path.join(output_dir, f"scene-{scene_label}_{well}-{site}_{t_label}_{suf}.tif")
-                if not os.path.exists(candidate):
-                    out_path = candidate
-                    break
-                suf += 1
-
-        tifffile.imwrite(
-            out_path,
-            stack,
-            photometric="minisblack",
-            metadata={"axes": "TCZYX"},
-        )
-        written_paths.append(out_path)
-
-        ch_label = "all" if channel_indices is None else ",".join(map(str, channel_indices))
-        t_label_list = ["" if ti is None else str(ti) for ti in t_indices]
-        manifest_rows.append([
-            scene_label, well, str(site), ";".join(t_label_list), ch_label, out_path, str(stack.dtype), "x".join(map(str, stack.shape)), datetime.utcnow().isoformat()+"Z", str(seed) if seed is not None else ""
-        ])
-
-    if manifest_path:
-        os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
-        with open(manifest_path, "w", newline="", encoding="utf-8") as mf:
-            w = csv.writer(mf)
-            w.writerow(manifest_header)
-            w.writerows(manifest_rows)
-
-    return written_paths
+    _write_manifest(Path(manifest_path), rows, overwrite=overwrite)
+    return saved_paths
 
 
-# -----------------------------
-# CLI
-# -----------------------------
+def _write_manifest(path: Path, rows: List[SampleRow], overwrite: bool = False):
+    if path.exists() and (not overwrite):
+        raise FileExistsError(f"{path} exists; pass --overwrite or change --manifest-path.")
+    fieldnames = list(asdict(rows[0]).keys()) if rows else [
+        "scene","well","site","t_indices","t_pick","channels","out_path","dtype","shape","mode","run_timestamp","seed"
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(asdict(r))
 
-import click
 
-@click.command()
-@click.argument("input_czi", type=click.Path(exists=True, dir_okay=False, path_type=str))
-@click.option("--output-dir", "output_dir", type=click.Path(file_okay=False, path_type=str), default="czi_samples", help="Directory to write sampled TIFFs.")
-@click.option("--n-images", "n_images", type=int, default=10, show_default=True, help="Number of samples (scenes) to export.")
-@click.option("--n-time-frames", "n_time_frames", type=int, default=3, show_default=True, help="Number of time frames per sample if time-lapse is present.")
-@click.option("--channels", "channels", type=str, default="all", show_default=True, help="Channels to include: 'all' or comma-separated indices, e.g., '0,1'.")
-@click.option("--seed", "seed", type=int, default=None, help="Random seed for reproducibility.")
-@click.option("--overwrite/--no-overwrite", "overwrite", default=False, show_default=True, help="Overwrite existing files.")
-@click.option("--manifest", "manifest", is_flag=True, default=False, help="Write a manifest CSV to OUTPUT_DIR/manifest.csv.")
-@click.option("--manifest-path", "manifest_path", type=click.Path(dir_okay=False, path_type=str), default=None, help="Optional explicit path for the manifest CSV.")
+# ---------------------------- CLI ---------------------------------------------
 
-def main(input_czi: str, output_dir: str, n_images: int, n_time_frames: int, channels: str, seed: Optional[int], overwrite: bool, manifest: bool, manifest_path: Optional[str]) -> None:
-    """CLI entry point."""
-    ch: Union[str, Sequence[int]]
-    if isinstance(channels, str) and channels.lower().strip() == "all":
-        ch = "all"
-    else:
-        try:
-            ch = [int(x.strip()) for x in channels.split(",") if x.strip() != ""]
-        except Exception:
-            raise click.BadOptionUsage("channels", "Invalid channels specification. Use 'all' or comma-separated indices like '0,1'.")
+def _build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser("czi-sampler", description="Export sampled scenes/time windows from CZI to TIFFs.")
+    p.add_argument("input_czi", help="Path to .czi")
+    p.add_argument("-o", "--output-dir", default="./czi_samples", help="Output directory")
+    p.add_argument("-n", "--n-images", type=int, default=10, help="How many scenes to sample")
+    p.add_argument("-t", "--n-time-frames", type=int, default=3, help="Consecutive time frames to consider per sample")
+    p.add_argument("--channels", default="all", help="'all' or comma-separated indices, e.g. 0,1")
+    p.add_argument("--seed", type=int, default=None, help="RNG seed for reproducibility")
+    p.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")
+    p.add_argument("--manifest", action="store_true", help="Write manifest.csv next to outputs (default: on)")
+    p.add_argument("--manifest-path", default=None, help="Custom manifest path")
+    p.add_argument("--cellpose4", action="store_true",
+                   help="Write Cellpose‑4 friendly arrays by dropping T and using HWC/ZHWC.")
+    return p
 
-    if manifest and not manifest_path:
-        manifest_path = os.path.join(output_dir, "manifest.csv")
 
-    written = sample_czi_to_tiffs(
-        input_czi=input_czi,
-        output_dir=output_dir,
-        n_images=n_images,
-        n_time_frames=n_time_frames,
-        channels=ch,
-        seed=seed,
-        overwrite=overwrite,
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ap = _build_argparser()
+    args = ap.parse_args(argv)
+
+    manifest_path = args.manifest_path
+    if manifest_path is None and args.manifest:
+        manifest_path = Path(args.output_dir) / "manifest.csv"
+
+    paths = sample_czi_to_tiffs(
+        input_czi=args.input_czi,
+        output_dir=args.output_dir,
+        n_images=args.n_images,
+        n_time_frames=args.n_time_frames,
+        channels=args.channels,
+        seed=args.seed,
+        overwrite=args.overwrite,
         manifest_path=manifest_path,
+        cellpose4=args.cellpose4,
     )
-    click.echo(f"Wrote {len(written)} TIFFs to {output_dir}")
-    if manifest_path:
-        click.echo(f"Manifest: {manifest_path}")
-    for p in written:
-        click.echo(f"- {p}")
+
+    print("\n".join(paths))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
