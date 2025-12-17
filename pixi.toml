@@ -1,0 +1,15 @@
+[workspace]
+authors = ["Harri Jäälinoja <harri.jaalinoja@helsinki.fi>"]
+channels = ["conda-forge"]
+name = "plate-sampler"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+bioio = ">=3.1.0,<4"
+pip = ">=25.3,<26"
+
+[pypi-dependencies]
+bioio-czi = ">=2.4.2, <3"
