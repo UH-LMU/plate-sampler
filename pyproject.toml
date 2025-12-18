@@ -1,11 +1,11 @@
 
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=80.0", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "plate-sampler"
-version = "0.1.1"
+dynamic = [version]
 description = "Random sampling utilities for plate-reader datasets (MetaXpress) and Zeiss CZI."
 authors = [
   { name = "Harri Tapio Jäälinoja" },
@@ -34,3 +34,7 @@ Repository = "https://example.com/plate-sampler"
 [project.scripts]
 mx-sampler = "plate_sampler.mx_sampler:main"
 czi-sampler = "plate_sampler.czi_sampler:main"
+
+
+[tool.setuptools_scm]
+version_file = "plate_sampler/_version.py"
