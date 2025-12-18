@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "plate-sampler"
-dynamic = [version]
+dynamic = ["version"]
 description = "Random sampling utilities for plate-reader datasets (MetaXpress) and Zeiss CZI."
 authors = [
   { name = "Harri Tapio Jäälinoja" },
